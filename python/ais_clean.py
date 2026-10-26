@@ -21,7 +21,10 @@ input_dir = Path(f"D:/AIS_Data/AIS_Monthly_{year}")
 output_dir = Path("D:/AIS_Cleaned_Test")
 
 output_dir.mkdir(parents=True, exist_ok=True)
-
+# File paths
+landflag_path = output_dir / f"AIS_{year}_{month}_LANDFLAG.csv"
+speed_cleaned_path = output_dir / f"AIS_{year}_{month}_FINAL.csv"
+geometry_cleaned_path = output_dir / f"AIS_{year}_{month}_GEOM_CLEANED.csv"
 
 ### ----- 1. REMOVE GPS JITTER --------- ####
 
@@ -512,19 +515,105 @@ def calculate_sog(
 
     print_vessel_stats(df_final)
 
-# Usage
-output_path = output_dir / "AIS_2020_05_LANDFLAG.csv"
-final_path = output_dir / "AIS_2020_05_FINAL.csv"
-
 if __name__ == "__main__":
     # Step 3: Calculate SOG and flag/remove outliers
     calculate_sog(
-    input_csv= output_path,
-    output_csv=final_path
+    input_csv= landflag_path,
+    output_csv=speed_cleaned_path
     )
 
 ### ----- 4. FLAG/REMOVE POINTS USING HEADING CHANGE ANALYSIS ----- ###
-# 
+# Use geometric trajectory anomaly detection to remove points where the ship's path is pysically impossible
 
+def run_geometrical_cleaning(input_csv, output_csv, cos_threshold=0.0):
+    print("\n" + "="*60)
+    print(" === STEP 4: GEOMETRICAL TRAJECTORY ANOMALY DETECTION ===")
+    print(" === METHOD: COSINE SIMILARITY OF HEADING CHANGE ===")
+    print("="*60)
+    
+    # 1. LOAD THE SPEED-CLEANED DATA
+    if not Path(input_csv).exists():
+        print(f"Error: Input file {input_csv} does not exist.")
+        return
+        
+    df = pd.read_csv(input_csv)
+    total_rows = len(df)
+    
+    if total_rows < 3:
+        print("Not enough data points to perform geometric vector analysis.")
+        return
 
+    print(f"Loading {Path(input_csv).name}...")
 
+    # 2. PROJECT TO METERS (EPSG:5070) FOR ACCURATE HEADING VECTORS
+    gdf = gpd.GeoDataFrame(
+        df.copy(), 
+        geometry=gpd.points_from_xy(df['longitude'], df['latitude']), 
+        crs="EPSG:4326"
+    ).to_crs(epsg=5070)
+    
+    gdf['X'] = gdf.geometry.x
+    gdf['Y'] = gdf.geometry.y
+
+    # Force sequential chronological ordering per vessel track
+    gdf = gdf.sort_values(['mmsi', 'base_date_time'])
+
+    # 3. COMPUTE VECTORS
+    gdf['dx_A'] = gdf['X'] - gdf.groupby('mmsi')['X'].shift(1)
+    gdf['dy_A'] = gdf['Y'] - gdf.groupby('mmsi')['Y'].shift(1)
+    gdf['dx_B'] = gdf.groupby('mmsi')['dx_A'].shift(-1)
+    gdf['dy_B'] = gdf.groupby('mmsi')['dy_A'].shift(-1)
+
+    # 4. CALCULATE THE VECTOR DOT PRODUCT & COS-THETA SIMILARITY
+    dot_product = (gdf['dx_A'] * gdf['dx_B']) + (gdf['dy_A'] * gdf['dy_B'])
+    magnitude_A = np.sqrt(gdf['dx_A']**2 + gdf['dy_A']**2)
+    magnitude_B = np.sqrt(gdf['dx_B']**2 + gdf['dy_B']**2)
+    
+    denominator = magnitude_A * magnitude_B
+    gdf['cos_theta'] = np.where(denominator > 0, dot_product / denominator, 1.0)
+    gdf['cos_theta'] = np.clip(gdf['cos_theta'], -1.0, 1.0)
+
+    # 5. MASK AND PRUNE ANOMALOUS PINGS
+    df['cos_theta_heading'] = gdf['cos_theta']
+    geometric_outlier_mask = df['cos_theta_heading'] < cos_threshold
+    
+    # --- NEW: COUNT HOW MANY REMOVED POINTS ARE NEAR LAND ---
+    # We look only at rows where the outlier mask is True, then sum up the land flag
+    total_removed = geometric_outlier_mask.sum()
+    removed_near_land = df.loc[geometric_outlier_mask, 'flag_1nm_land'].sum()
+    removed_offshore = total_removed - removed_near_land
+    
+    # --- SAVE REMOVED POINTS TO A SEPARATE CSV ---
+    if total_removed > 0:
+        # Create a separate path named like your output file, but ending in _GEOM_REMOVED.csv
+        removed_output_path = Path(output_csv).parent / f"{Path(output_csv).stem}_REMOVED.csv"
+        
+        # Extract only the anomalous rows
+        df_removed = df[geometric_outlier_mask].copy()
+        df_removed.to_csv(removed_output_path, index=False)
+        print(f"  --> Saved {total_removed:,} anomalous points to: {removed_output_path.name}")
+    else:
+        print("  --> No anomalies detected; skipping removed points CSV export.")
+    # --------------------------------------------------------
+
+    # Keep only the rows that are NOT outliers for your final clean dataset
+    df_cleaned = df[~geometric_outlier_mask].copy()
+    df_cleaned.to_csv(output_csv, index=False)
+
+    # PRINT STATS
+    print(f"\n Total Rows Loaded:           {total_rows:,}")
+    print(f" Cos-Theta Cutoff Threshold:  {cos_threshold} (Turns > {np.degrees(np.arccos(cos_threshold)):.1f}° removed)")
+    print(f" Total Sharp Turns Pruned:    {total_removed:,} rows ({(total_removed/total_rows)*100:.2f}%)")
+    print(f"   * Pruned within 1nm of Land: {removed_near_land:,} rows") # <-- Added print
+    print(f"   * Pruned Offshore (Ocean):  {removed_offshore:,} rows")    # <-- Added print
+    print(f" Final Cleaned File Exported: {Path(output_csv).name}")
+    print("="*60 + "\n")
+
+if __name__ == "__main__":
+    # Step 4: Run standalone Geometric Cleaning 
+    # Setting threshold to 0.0 removes pings that turn sharper than 90 degrees instantly.
+    run_geometrical_cleaning(
+        input_csv=speed_cleaned_path,
+        output_csv=geometry_cleaned_path,
+        cos_threshold=0.0 
+    )
